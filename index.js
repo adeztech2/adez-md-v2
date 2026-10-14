@@ -284,4 +284,74 @@ async function startSession(s) {
         const msg = String(err?.message || '')
         console.log(`❌ [${s.id}] Connection closed. Code: ${code} | ${msg}`)
 
-        // 51
+        // 515 = WhatsApp wants a restart right after pairing. Just reconnect.
+        if (code === DisconnectReason.restartRequired) return scheduleStart(s, 1000)
+
+        if (code === DisconnectReason.connectionReplaced || msg.toLowerCase().includes('conflict')) {
+          s.status = 'conflict'
+          console.log(`🚨 [${s.id}] CONFLICT: another copy uses this login. Stopping this session.`)
+          return stopSocket(s)
+        }
+
+        if (code === DisconnectReason.loggedOut && s.live) return removeSession(s, 'user logged out')
+
+        if (!s.live) {
+          emitTo(s, 'pairError', 'Pairing did not finish. Try again.')
+          return removeSession(s, 'pairing did not finish')
+        }
+
+        scheduleStart(s, 5000)
+      }
+    })
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (sock !== s.sock) return
+      for (const m of messages) cacheMessage(s, m)
+      if (type !== 'notify') return
+      for (const m of messages) {
+        try { await handleMessage(sock, m) } catch (e) { console.log(`❌ [${s.id}] handler error:`, e.stack || e) }
+      }
+    })
+  } finally {
+    s.starting = false
+  }
+}
+
+async function startAllSessions() {
+  const ids = []
+  try {
+    const { data, error } = await supabase.from('bu_sessions').select('id')
+    if (error) throw error
+    for (const row of data || []) ids.push(row.id)
+  } catch (e) {
+    console.log('⚠️ Could not list saved sessions:', e.message)
+  }
+  console.log(`👥 Starting ${Math.min(ids.length, MAX_SESSIONS)} saved session(s) (max ${MAX_SESSIONS})`)
+  for (const id of ids.slice(0, MAX_SESSIONS)) {
+    const s = makeState(id)
+    sessions.set(id, s)
+    try { await startSession(s) } catch (e) { console.log(`❌ [${id}] start failed:`, e.message); scheduleStart(s, 5000) }
+    await sleep(STAGGER_MS)
+  }
+}
+
+server.listen(PORT, async () => {
+  console.log(`🌐 Server running on port ${PORT}`)
+  await loadCommands()
+  await loadObservers()
+  await loadSettings()
+  if (START_DELAY_MS > 0) {
+    console.log(`⏳ Waiting ${START_DELAY_MS / 1000}s so any older copy can shut down first...`)
+    await sleep(START_DELAY_MS)
+  }
+  await startAllSessions()
+})
+
+async function shutdown() {
+  try { await Promise.all([...sessions.values()].map((s) => uploadSession(s))) } catch {}
+  process.exit(0)
+}
+process.on('SIGTERM', shutdown)
+process.on('SIGINT', shutdown)
+process.on('unhandledRejection', (e) => console.log('Unhandled rejection:', e))
+process.on('uncaughtException', (e) => console.log('Uncaught exception:', e))

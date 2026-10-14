@@ -1,7 +1,7 @@
 // ============================================================
-//  ADEZ MD v2 - index.js
-//  Every number (yours too) links from /pair.html with a pair code.
+//  ADEZ MD - index.js  (v3: every number links with a pair code)
 //  Logins are saved in Supabase table bu_sessions (id, data) as 'user_<number>'.
+//  Works with your existing lib/router.js, events.js, settings.js, autobio.js
 // ============================================================
 import 'dotenv/config'
 import fs from 'fs'
@@ -19,9 +19,31 @@ const makeWASocket =
   (typeof baileysNS.default === 'function' ? baileysNS.default : baileysNS.default?.default) ||
   baileys.makeWASocket
 const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = baileys
-import { loadCommands, handleMessage, getAllCommands, PREFIX, BOT_NAME } from './lib/router.js'
+import { loadCommands, loadObservers, handleMessage, getAllCommands } from './lib/router.js'
+import { registerEvents } from './lib/events.js'
 import { box } from './lib/style.js'
+import { loadSettings, getSetting } from './lib/settings.js'
+import { startAutoBio } from './lib/autobio.js'
 
+// ---------- Quiet the encryption log spam ----------
+const NOISE_PREFIXES = [
+  'Closing session', 'Closing open session', 'Failed to decrypt message with any known session',
+  'Session error:', 'Bad MAC', 'Decrypted message with closed session', 'Removing old closed session'
+]
+let noiseCount = 0
+for (const fn of ['log', 'info', 'warn', 'error']) {
+  const orig = console[fn].bind(console)
+  console[fn] = (...args) => {
+    if (typeof args[0] === 'string' && NOISE_PREFIXES.some((p) => args[0].startsWith(p))) { noiseCount++; return }
+    orig(...args)
+  }
+}
+setInterval(() => {
+  if (noiseCount > 0) { console.log(`ℹ️ Hid ${noiseCount} encryption log lines in the last minute`); noiseCount = 0 }
+}, 60 * 1000).unref()
+
+// ---------- Settings ----------
+const BOT_NAME = process.env.BOT_NAME || 'ADEZ MD'
 const PORT = process.env.PORT || 3000
 const OWNER_NUMBER = String(process.env.OWNER_NUMBER || '').replace(/\D/g, '')
 const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 5)
@@ -45,12 +67,20 @@ const emitTo = (s, event, payload) => { if (s.pairClient) io.to(s.pairClient).em
 
 function makeState(id, opts = {}) {
   return {
-    id, dir: path.join(SESSIONS_ROOT, id), sock: null, status: 'starting',
-    restored: !!opts.skipRestore, live: false, starting: false, removed: false,
+    id, number: id.replace(/^user_/, ''), dir: path.join(SESSIONS_ROOT, id),
+    sock: null, status: 'starting', restored: !!opts.skipRestore, live: false,
+    starting: false, removed: false,
     startTimer: null, syncTimer: null, syncInterval: null, pairTimeout: null,
     pendingSave: Promise.resolve(), lastSync: 0, welcomeSent: false,
-    pairNumber: opts.pairNumber || null, pairClient: opts.pairClient || null, pairAsked: false
+    pairNumber: opts.pairNumber || null, pairClient: opts.pairClient || null, pairAsked: false,
+    msgCache: new Map()
   }
+}
+
+function cacheMessage(s, m) {
+  if (!m?.key?.id || !m.message) return
+  s.msgCache.set(m.key.id, m.message)
+  if (s.msgCache.size > 300) s.msgCache.delete(s.msgCache.keys().next().value)
 }
 
 // ---------- Web ----------
@@ -60,6 +90,7 @@ app.get('/', (req, res) => {
 app.use(express.static('public', { index: false }))
 
 io.on('connection', (client) => {
+  client.emit('status', 'waiting_for_scan')
   client.on('requestPair', async (number) => {
     try {
       const clean = String(number || '').replace(/\D/g, '')
@@ -173,9 +204,11 @@ async function startSession(s) {
     const sock = makeWASocket({
       version, auth: state, logger, browser: Browsers.ubuntu('Chrome'),
       printQRInTerminal: false, syncFullHistory: false, fireInitQueries: false,
-      markOnlineOnConnect: false, generateHighQualityLinkPreview: false
+      markOnlineOnConnect: false, generateHighQualityLinkPreview: false,
+      getMessage: async (key) => s.msgCache.get(key?.id)
     })
     s.sock = sock
+    registerEvents(sock)
 
     sock.ev.on('creds.update', () => {
       s.pendingSave = s.pendingSave.then(() => saveCreds()).catch((e) => console.log(`⚠️ [${s.id}] saveCreds failed:`, e.message))
@@ -186,7 +219,7 @@ async function startSession(s) {
       if (sock !== s.sock || s.removed) return
       const { connection, lastDisconnect, qr } = update
 
-      // Socket is ready for a brand-new login: ask WhatsApp for the pair code
+      // A brand-new login is ready: ask WhatsApp for the pair code
       if (qr) {
         if (s.pairNumber && !s.pairAsked) {
           s.pairAsked = true
@@ -208,8 +241,10 @@ async function startSession(s) {
         s.status = 'connected'
         s.live = true
         if (s.pairTimeout) { clearTimeout(s.pairTimeout); s.pairTimeout = null }
+        emitTo(s, 'status', 'connected')
         emitTo(s, 'connected', true)
         console.log(`✅ [${s.id}] ${BOT_NAME} connected! (${connectedCount()}/${sessions.size})`)
+        if (OWNER_NUMBER && s.number === OWNER_NUMBER) startAutoBio(sock)
         uploadSession(s)
 
         if (!s.syncInterval) {
@@ -224,13 +259,15 @@ async function startSession(s) {
 
         if (!s.welcomeSent) {
           s.welcomeSent = true
+          const prefix = getSetting('prefix') || '.'
           const jid = String(sock.user?.id || '').split(':')[0].split('@')[0] + '@s.whatsapp.net'
           const alert = box(`${BOT_NAME} LINKED`, [
             ['status', 'Connected successfully ✅'],
-            ['prefix', `[ ${PREFIX} ]`],
-            ['commands', getAllCommands().length],
+            ['owner', OWNER_NUMBER && s.number === OWNER_NUMBER ? 'Arnold Adez' : 'You'],
+            ['prefix', `[ ${prefix} ]`],
+            ['plugins', getAllCommands().length],
             ['time', new Date().toLocaleString('en-GB', { timeZone: 'Africa/Nairobi' })]
-          ]) + `\n\n_Type ${PREFIX}menu to see all commands_`
+          ]) + `\n\n_Type ${prefix}menu to see all commands_`
           const image = process.env.MENU_IMAGE
           try {
             await sock.sendMessage(jid, image ? { image: { url: image }, caption: alert } : { text: alert })
@@ -247,71 +284,4 @@ async function startSession(s) {
         const msg = String(err?.message || '')
         console.log(`❌ [${s.id}] Connection closed. Code: ${code} | ${msg}`)
 
-        // 515 = WhatsApp wants a restart right after pairing. Just reconnect.
-        if (code === DisconnectReason.restartRequired) return scheduleStart(s, 1000)
-
-        if (code === DisconnectReason.connectionReplaced || msg.toLowerCase().includes('conflict')) {
-          s.status = 'conflict'
-          console.log(`🚨 [${s.id}] CONFLICT: another copy uses this login. Stopping this session.`)
-          return stopSocket(s)
-        }
-
-        if (code === DisconnectReason.loggedOut && s.live) return removeSession(s, 'user logged out')
-
-        if (!s.live) {
-          emitTo(s, 'pairError', 'Pairing did not finish. Try again.')
-          return removeSession(s, 'pairing did not finish')
-        }
-
-        scheduleStart(s, 5000)
-      }
-    })
-
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (sock !== s.sock || type !== 'notify') return
-      const owners = [OWNER_NUMBER].filter(Boolean)
-      for (const m of messages) {
-        try { await handleMessage(sock, m, owners) } catch (e) { console.log(`❌ [${s.id}] handler error:`, e.stack || e) }
-      }
-    })
-  } finally {
-    s.starting = false
-  }
-}
-
-async function startAllSessions() {
-  const ids = []
-  try {
-    const { data, error } = await supabase.from('bu_sessions').select('id').like('id', 'user_%')
-    if (error) throw error
-    for (const row of data || []) ids.push(row.id)
-  } catch (e) {
-    console.log('⚠️ Could not list saved sessions:', e.message)
-  }
-  console.log(`👥 Starting ${Math.min(ids.length, MAX_SESSIONS)} saved session(s) (max ${MAX_SESSIONS})`)
-  for (const id of ids.slice(0, MAX_SESSIONS)) {
-    const s = makeState(id)
-    sessions.set(id, s)
-    try { await startSession(s) } catch (e) { console.log(`❌ [${id}] start failed:`, e.message); scheduleStart(s, 5000) }
-    await sleep(STAGGER_MS)
-  }
-}
-
-server.listen(PORT, async () => {
-  console.log(`🌐 Server running on port ${PORT}`)
-  await loadCommands()
-  if (START_DELAY_MS > 0) {
-    console.log(`⏳ Waiting ${START_DELAY_MS / 1000}s so any older copy can shut down first...`)
-    await sleep(START_DELAY_MS)
-  }
-  await startAllSessions()
-})
-
-async function shutdown() {
-  try { await Promise.all([...sessions.values()].map((s) => uploadSession(s))) } catch {}
-  process.exit(0)
-}
-process.on('SIGTERM', shutdown)
-process.on('SIGINT', shutdown)
-process.on('unhandledRejection', (e) => console.log('Unhandled rejection:', e))
-process.on('uncaughtException', (e) => console.log('Uncaught exception:', e))
+        // 51

@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="theme-color" content="#000000" />
+<title>ADEZ MD • Connect</title>
+<style>
+  :root{--bg:#05070d;--card:#0b1220;--line:#16243d;--blue:#2f7bff;--blue2:#00b4ff;--text:#eaf1ff;--muted:#8a9bb8;--ok:#22d3a0;--err:#ff5c7a}
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+    background:radial-gradient(900px 500px at 50% -10%,rgba(47,123,255,.25),transparent 60%),var(--bg);
+    color:var(--text);min-height:100vh;display:flex;justify-content:center;padding:28px 16px 40px}
+  .wrap{width:100%;max-width:420px}
+  header{text-align:center;margin-bottom:20px}
+  h1{font-size:26px;letter-spacing:.5px}
+  h1 span{color:var(--blue2)}
+  .sub{color:var(--muted);font-size:13px;margin-top:4px}
+  .pill{display:inline-flex;align-items:center;gap:8px;margin-top:12px;padding:7px 14px;border-radius:999px;
+    background:var(--card);border:1px solid var(--line);font-size:13px;color:var(--muted)}
+  .dot{width:8px;height:8px;border-radius:50%;background:#f5a524}
+  .pill.ok .dot{background:var(--ok)} .pill.bad .dot{background:var(--err)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:20px}
+  .card h2{font-size:17px;margin-bottom:4px}
+  .hint{color:var(--muted);font-size:13px;margin-bottom:14px}
+  input{width:100%;padding:14px;border-radius:12px;border:1px solid var(--line);background:#060b16;color:var(--text);
+    font-size:16px;outline:none;margin-bottom:12px}
+  input:focus{border-color:var(--blue)}
+  .btn{width:100%;padding:14px;border:none;border-radius:12px;font-size:16px;font-weight:700;color:#fff;cursor:pointer;
+    background:linear-gradient(135deg,var(--blue),var(--blue2))}
+  .btn:disabled{opacity:.5}
+  .btn.ghost{background:transparent;border:1px solid var(--blue);color:var(--blue2);margin-top:10px}
+  .codebox{display:none;margin-top:18px;text-align:center}
+  .codebox.show{display:block}
+  .digits{display:flex;justify-content:center;align-items:center;gap:6px}
+  .digit{width:34px;height:46px;display:grid;place-items:center;border-radius:10px;font-size:22px;font-weight:800;
+    background:#060b16;border:1px solid var(--blue);color:var(--blue2)}
+  .dash{color:var(--muted);font-weight:700}
+  .timer{color:var(--muted);font-size:12px;margin-top:10px}
+  .err{color:var(--err);font-size:13px;margin-top:10px;text-align:center;min-height:16px}
+  ol{margin:16px 0 0 18px;color:var(--muted);font-size:13px;line-height:1.8}
+  ol b{color:var(--text)}
+  .success{display:none;text-align:center;padding:30px 10px}
+  .success.show{display:block}
+  .check{width:70px;height:70px;border-radius:50%;margin:0 auto 14px;display:grid;place-items:center;font-size:34px;
+    background:rgba(34,211,160,.12);border:2px solid var(--ok);color:var(--ok)}
+  footer{text-align:center;color:var(--muted);font-size:12px;margin-top:22px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>ADEZ <span>MD</span></h1>
+    <div class="sub">Link your WhatsApp in seconds</div>
+    <div id="pill" class="pill"><span class="dot"></span><span id="statusText">Connecting to server...</span></div>
+  </header>
+
+  <div id="main" class="card">
+    <h2>Link with phone number</h2>
+    <p class="hint">Enter your WhatsApp number with country code. No + or spaces.</p>
+    <input id="number" type="tel" inputmode="numeric" placeholder="e.g. 254111783552" autocomplete="off" />
+    <button id="getBtn" class="btn">Get pair code</button>
+
+    <div id="codebox" class="codebox">
+      <div id="digits" class="digits"></div>
+      <button id="copyBtn" class="btn ghost">📋 Copy code</button>
+      <div class="timer">Enter it in WhatsApp within <b id="timer">60</b>s</div>
+    </div>
+    <div id="err" class="err"></div>
+
+    <ol>
+      <li>Open <b>WhatsApp</b> &rarr; <b>Linked devices</b></li>
+      <li>Tap <b>Link a device</b></li>
+      <li>Tap <b>Link with phone number instead</b></li>
+      <li>Type the code</li>
+    </ol>
+  </div>
+
+  <div id="success" class="success card">
+    <div class="check">✓</div>
+    <h2>Bot connected!</h2>
+    <p class="hint" style="margin-top:6px">Check WhatsApp, then send <b>.menu</b></p>
+  </div>
+
+  <footer>ADEZ MD • by Arnold Adez</footer>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const socket = io();
+  let currentCode = '', countdown = null;
+
+  function setStatus(text, cls) { $('statusText').textContent = text; $('pill').className = 'pill ' + (cls || ''); }
+  socket.on('connect', () => setStatus('Server online', 'ok'));
+  socket.on('disconnect', () => setStatus('Server offline...', 'bad'));
+  socket.on('connect_error', () => setStatus('Cannot reach server...', 'bad'));
+
+  function resetBtn() { $('getBtn').disabled = false; $('getBtn').textContent = 'Get pair code'; }
+
+  function showCode(code) {
+    currentCode = String(code).replace(/[^A-Za-z0-9]/g, '');
+    const d = $('digits'); d.innerHTML = '';
+    currentCode.split('').forEach((ch, i) => {
+      if (i === 4) d.insertAdjacentHTML('beforeend', '<span class="dash">-</span>');
+      d.insertAdjacentHTML('beforeend', '<div class="digit">' + ch + '</div>');
+    });
+    $('codebox').classList.add('show');
+    $('err').textContent = '';
+    clearInterval(countdown);
+    let left = 60; $('timer').textContent = left;
+    countdown = setInterval(() => {
+      left--; $('timer').textContent = Math.max(left, 0);
+      if (left <= 0) { clearInterval(countdown); $('codebox').classList.remove('show'); $('err').textContent = 'Code expired. Tap "Get pair code" again.'; }
+    }, 1000);
+  }
+
+  socket.on('pairCode', (c) => { resetBtn(); showCode(c); });
+  socket.on('pairError', (e) => { resetBtn(); clearInterval(countdown); $('codebox').classList.remove('show'); $('err').textContent = e; });
+  socket.on('connected', () => {
+    clearInterval(countdown);
+    $('main').style.display = 'none';
+    $('success').classList.add('show');
+    setStatus('Bot connected', 'ok');
+  });
+
+  $('getBtn').onclick = () => {
+    const n = $('number').value.replace(/\D/g, '');
+    if (n.length < 8) { $('err').textContent = 'Enter a valid number with country code'; return; }
+    $('err').textContent = '';
+    $('getBtn').disabled = true; $('getBtn').textContent = 'Generating...';
+    socket.emit('requestPair', n);
+  };
+
+  $('copyBtn').onclick = async () => {
+    if (!currentCode) return;
+    try { await navigator.clipboard.writeText(currentCode); $('copyBtn').textContent = '✅ Copied'; }
+    catch (e) { $('copyBtn').textContent = 'Copy failed, type it'; }
+    setTimeout(() => ($('copyBtn').textContent = '📋 Copy code'), 1800);
+  };
+</script>
+</body>
+</html>
